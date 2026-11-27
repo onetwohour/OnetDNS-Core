@@ -23,6 +23,8 @@ use std::sync::mpsc;
 thread_local! {
 
     static REQUEST_START: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    static HOLDING_LOG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static HELD_LOG: std::cell::RefCell<Vec<QueryEvent>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// 0 without a running timer.
@@ -1090,6 +1092,31 @@ impl Recorder {
             log: true,
             stat: do_stat,
         };
+        if HOLDING_LOG.get() {
+            HELD_LOG.with_borrow_mut(|held| held.push(ev));
+            return;
+        }
+        self.queue_log(ev);
+    }
+
+    /// Until `release_log` on this thread, query log entries wait here instead of going to the
+    /// collector. Queuing one wakes the collector with a system call, which a worker holding
+    /// responses it has yet to send should not wait for.
+    pub fn hold_log(&self) {
+        HOLDING_LOG.set(true);
+    }
+
+    /// Queues what this thread held since `hold_log` and stops holding.
+    pub fn release_log(&self) {
+        HOLDING_LOG.set(false);
+        let mut held = HELD_LOG.take();
+        for ev in held.drain(..) {
+            self.queue_log(ev);
+        }
+        HELD_LOG.set(held);
+    }
+
+    fn queue_log(&self, ev: QueryEvent) {
         if let Err(error) = self.log_tx.try_send(CollectorEvent::Log(ev)) {
             let dropped = self
                 .metrics
@@ -3253,6 +3280,48 @@ mod tests {
         assert_eq!(seen_on.len(), 1, "기록이 켜졌으면 항목이 남아야 합니다");
         assert_eq!(seen_on[0].rcode, "NOERROR", "응답 코드가 실려야 합니다");
         assert_eq!(seen_on[0].qtype, "A", "질의 종류가 실려야 합니다");
+    }
+
+    #[test]
+    fn held_log_entries_reach_the_log_only_when_released() {
+        let (recorder, stats) =
+            channel(64, 100, 0, RecorderOpts::default(), PersistOpts::default());
+        let name = Name::from_str("held.example.").unwrap();
+        let record = || {
+            recorder.record(
+                Transport::Do53Udp,
+                Action::Resolved,
+                "127.0.0.1".parse().unwrap(),
+                Some(&name),
+                Some(RecordType::A),
+                true,
+                true,
+            )
+        };
+        recorder.hold_log();
+        record();
+        record();
+        assert_eq!(HELD_LOG.with_borrow(Vec::len), 2);
+        assert_eq!(
+            recorder.metrics().snapshot().total,
+            2,
+            "counters do not wait"
+        );
+
+        recorder.release_log();
+        assert_eq!(HELD_LOG.with_borrow(Vec::len), 0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while stats.recent(4).len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(stats.recent(4).len(), 2);
+
+        record();
+        assert_eq!(
+            HELD_LOG.with_borrow(Vec::len),
+            0,
+            "released means queued at once"
+        );
     }
 
     #[test]

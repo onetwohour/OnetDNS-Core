@@ -183,6 +183,13 @@ pub trait Handler: Send + Sync + 'static {
         None
     }
 
+    /// A UDP worker calls this before it handles a round of datagrams and `end_round` once their
+    /// responses are sent, so work the responses do not need, such as queuing query log entries,
+    /// does not delay them.
+    fn begin_round(&self) {}
+
+    fn end_round(&self) {}
+
     /// UDP workers of a reactor server ask this on every loop and switch between the reactor and
     /// the synchronous loop when it changes. When it turns false the worker leaves the reactor loop
     /// and stops advancing its exchanges, so it must stay true while this thread still owns
@@ -629,7 +636,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, TcpStream, UdpSocket};
     use std::sync::atomic::AtomicUsize;
-    use std::sync::Mutex;
+    use std::sync::{mpsc, Mutex};
     use std::time::Instant;
 
     struct EchoA {
@@ -712,6 +719,61 @@ mod tests {
         Message::query(id, Name::from_str(name).unwrap(), RecordType::A)
             .try_encode()
             .unwrap()
+    }
+
+    struct WaitsForTheClientInEndRound {
+        client_got_response: Mutex<mpsc::Receiver<()>>,
+        first_round: Mutex<Option<bool>>,
+    }
+
+    impl Handler for WaitsForTheClientInEndRound {
+        fn handle(&self, request: &Message, ctx: &RequestCtx) -> Option<Message> {
+            EchoA::new().handle(request, ctx)
+        }
+
+        fn end_round(&self) {
+            let mut first = self.first_round.lock().unwrap();
+            if first.is_none() {
+                let got = self
+                    .client_got_response
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2));
+                *first = Some(got.is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn udp_worker_sends_the_responses_before_ending_the_round() {
+        let (got_response, client_got_response) = mpsc::channel();
+        let handler = Arc::new(WaitsForTheClientInEndRound {
+            client_got_response: Mutex::new(client_got_response),
+            first_round: Mutex::new(None),
+        });
+        let server = Server::bind(local(0), handler.clone(), test_cfg()).unwrap();
+        let client = UdpSocket::bind(local(0)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client
+            .send_to(
+                &query_bytes(0x5151, "a.example.com"),
+                server.udp_addr().unwrap(),
+            )
+            .unwrap();
+        let mut buf = [0u8; 512];
+        client
+            .recv_from(&mut buf)
+            .expect("end_round ran before the response was sent");
+        got_response.send(()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while handler.first_round.lock().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(*handler.first_round.lock().unwrap(), Some(true));
+        server.shutdown();
     }
 
     #[test]

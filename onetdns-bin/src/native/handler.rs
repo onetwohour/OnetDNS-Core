@@ -27,6 +27,18 @@ use crate::native::response::{
 use crate::native::{NativeServer, MAX_LARGE_QUERY_BYTES};
 
 impl Handler for NativeServer {
+    fn begin_round(&self) {
+        if let Some(recorder) = &self.recorder {
+            recorder.hold_log();
+        }
+    }
+
+    fn end_round(&self) {
+        if let Some(recorder) = &self.recorder {
+            recorder.release_log();
+        }
+    }
+
     fn handle(&self, request: &Message, ctx: &RequestCtx) -> Option<Message> {
         // Ahead of TSIG errors, which go out before admission, so a dropped client gets no response
         // at all. With client-ID rules the ID decides whether a client is listed, not just the

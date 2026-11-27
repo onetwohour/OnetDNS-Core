@@ -138,13 +138,13 @@ fn single_worker<H: Handler>(
             continue;
         }
 
-        if !process_datagram(handler, &recv[..n], src, Instant::now(), &mut writer) {
-            continue;
+        handler.begin_round();
+        if process_datagram(handler, &recv[..n], src, Instant::now(), &mut writer) {
+            if let Err(error) = sock.send_to(&writer.buf, src) {
+                record_send_error(src, writer.buf.len(), &error);
+            }
         }
-
-        if let Err(error) = sock.send_to(&writer.buf, src) {
-            record_send_error(src, writer.buf.len(), &error);
-        }
+        handler.end_round();
     }
 }
 
@@ -246,6 +246,7 @@ fn reactor_worker<H: Handler>(sock: &UdpSocket, handler: &H, shutdown: &AtomicBo
         let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         let now = Instant::now();
 
+        handler.begin_round();
         if rc > 0 && fds[0].revents & libc::POLLIN != 0 {
             for _ in 0..64 {
                 if !handler.reactor_has_capacity() {
@@ -311,6 +312,7 @@ fn reactor_worker<H: Handler>(sock: &UdpSocket, handler: &H, shutdown: &AtomicBo
         for (dst, wire) in outq.drain(..) {
             send_or_record(sock, &wire, dst);
         }
+        handler.end_round();
     }
 
     let drain_until = Instant::now() + REACTOR_DRAIN_BUDGET;
@@ -587,6 +589,7 @@ mod batch {
 
             let mut out = 0usize;
 
+            handler.begin_round();
             let batch_now = Instant::now();
             for slot in 0..received as usize {
                 if received_message_is_truncated(recv_hdrs[slot].msg_hdr.msg_flags) {
@@ -639,6 +642,7 @@ mod batch {
                 }
                 sent += 1;
             }
+            handler.end_round();
         }
     }
 
