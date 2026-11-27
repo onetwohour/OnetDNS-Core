@@ -11,13 +11,14 @@ const MIN_RESET_LEN: usize = 21;
 const MAX_RESET_LEN: usize = 43;
 
 /// Derives the reset token of each connection ID. Clients of connections made before a restart
-/// accept a reset only if the key is the same, so the caller keeps it.
+/// accept a reset only if the key is the same.
 #[derive(Clone)]
 pub struct ResetKey([u8; 32]);
 
 impl ResetKey {
-    pub fn new(key: [u8; 32]) -> Self {
-        Self(key)
+    /// The same secret gives the same key in every process. The tokens do not reveal the secret.
+    pub fn derive(secret: &[u8]) -> Self {
+        Self(hmac_sha256(secret, b"OnetDNS QUIC stateless reset key"))
     }
 
     pub fn generate() -> Self {
@@ -56,15 +57,15 @@ mod tests {
 
     #[test]
     fn token_depends_on_the_key_and_the_connection_id() {
-        let key = ResetKey::new([7; 32]);
+        let key = ResetKey::derive(b"private key");
         assert_eq!(
             key.token(b"SERVERID"),
-            ResetKey::new([7; 32]).token(b"SERVERID")
+            ResetKey::derive(b"private key").token(b"SERVERID")
         );
         assert_ne!(key.token(b"SERVERID"), key.token(b"SERVERIE"));
         assert_ne!(
             key.token(b"SERVERID"),
-            ResetKey::new([8; 32]).token(b"SERVERID")
+            ResetKey::derive(b"other key").token(b"SERVERID")
         );
     }
 

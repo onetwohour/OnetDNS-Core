@@ -193,30 +193,6 @@ fn doh_listener_variant(cfg: &Config) -> String {
     variant
 }
 
-/// Kept in `quic-reset.key` next to the config, so a restarted server can still reset connections
-/// it had before. Without the file, only connections of this process can be reset.
-fn load_quic_reset_key(config_path: Option<&std::path::Path>) -> onetdns_quic::reset::ResetKey {
-    let Some(path) = config_path
-        .and_then(std::path::Path::parent)
-        .map(|dir| dir.join("quic-reset.key"))
-    else {
-        return onetdns_quic::reset::ResetKey::generate();
-    };
-    let reason = match load_or_create_key_seed(&path) {
-        Ok(seed) => return onetdns_quic::reset::ResetKey::new(*seed),
-        Err(KeyFileError::Corrupt) => {
-            "the file is corrupted; delete it to make a new key".to_string()
-        }
-        Err(KeyFileError::Read(error) | KeyFileError::Write(error)) => error.to_string(),
-    };
-    onetdns_core::warn!(event = "quic.reset_key_unavailable",
-        path = %path.display(),
-        %reason,
-        "Could not keep the QUIC stateless reset key; after a restart, DoQ and DoH3 clients wait for their idle timeout"
-    );
-    onetdns_quic::reset::ResetKey::generate()
-}
-
 fn encrypted_listener_key(kind: &str, addr: &SocketAddr, variant: &str) -> String {
     format!("{kind}|{addr}|{variant}")
 }
@@ -268,6 +244,9 @@ pub(crate) struct TlsSlots {
     doh3: Arc<onetdns_core::ArcSwap<onetdns_tls::ServerConfig>>,
     /// The HTTPS management listener.
     control: Arc<onetdns_core::ArcSwap<onetdns_tls::ServerConfig>>,
+    /// Derived from the private key, so after a restart with the same key DoQ and DoH3 can still
+    /// reset the connections made before it.
+    quic_reset: onetdns_quic::reset::ResetKey,
     /// The file-based material the slots use now, which tells whether contents changed under an
     /// unchanged path. Public values only; the private key stays in the slots, with no copy here.
     live_files: Mutex<LiveTlsFiles>,
@@ -353,6 +332,7 @@ impl TlsSlots {
             doq: Arc::new(onetdns_core::ArcSwap::new(doq)),
             doh3: Arc::new(onetdns_core::ArcSwap::new(doh3)),
             control: Arc::new(onetdns_core::ArcSwap::new(control)),
+            quic_reset: onetdns_quic::reset::ResetKey::derive(&material.1),
             live_files: Mutex::new(live_tls_files(cfg, material.0)?),
         })
     }
@@ -521,8 +501,6 @@ pub(crate) struct ListenerSet {
     doh3: Mutex<Vec<(String, quic_listener::QuicListener)>>,
     /// Shared by DoQ and DoH3 connections on every address.
     quic_memory: Arc<quic_memory::QuicMemoryBudget>,
-    /// Read when the first QUIC listener opens.
-    quic_reset: std::sync::OnceLock<onetdns_quic::reset::ResetKey>,
     /// Admission shared by DoH, DoT, and DNSCrypt TCP connections on every address.
     encrypted_tcp_admission: Arc<connection_limit::ConnectionLimiter>,
     dnscrypt: Mutex<Vec<DnscryptListener>>,
@@ -998,14 +976,13 @@ fn reconcile_encrypted(
         }};
     }
 
-    let need = |pick: fn(&TlsSlots) -> Arc<onetdns_core::ArcSwap<onetdns_tls::ServerConfig>>| {
+    let slots = || {
         TlsSlots::get_or_build(tls, cfg, self_signed_file, || set.take_ticket_keys())
-            .map(|slots| pick(&slots))
             .map_err(|error| format!("{NEED_TLS}: {error}"))
     };
 
     if !cfg.listen_dot.is_empty() || !set.dot.lock_recover().is_empty() {
-        let tls_cfg = need(|s| s.dot.clone())?;
+        let tls_cfg = slots()?.dot.clone();
         sync_one!(dot, cfg.listen_dot, "dot", |addr| tcp_socket(
             set,
             SocketRole::Dot,
@@ -1021,7 +998,7 @@ fn reconcile_encrypted(
         .map_err(|error| listener_open_error("DoT", addr, &error)));
     }
     if !cfg.listen_doh.is_empty() || !set.doh.lock_recover().is_empty() {
-        let tls_cfg = need(|s| s.doh.clone())?;
+        let tls_cfg = slots()?.doh.clone();
         // Built only when a listener opens, so a reload that leaves DoH alone never reads the key
         // files, and before any listener closes, so a bad key file leaves the old ones up.
         // Listeners opened together share it and the proxy's target connections.
@@ -1055,13 +1032,9 @@ fn reconcile_encrypted(
                 .map_err(|error| listener_open_error("DoH", addr, &error))
         });
     }
-    let quic_reset = || {
-        set.quic_reset
-            .get_or_init(|| load_quic_reset_key(config_path))
-            .clone()
-    };
     if !cfg.listen_doq.is_empty() || !set.doq.lock_recover().is_empty() {
-        let tls_cfg = need(|s| s.doq.clone())?;
+        let quic = slots()?;
+        let (tls_cfg, reset) = (quic.doq.clone(), &quic.quic_reset);
         sync_one!(doq, cfg.listen_doq, "doq", |addr| quic_socket(
             set,
             SocketRole::Doq,
@@ -1073,12 +1046,13 @@ fn reconcile_encrypted(
             handler.clone(),
             shutdown.clone(),
             set.quic_memory.clone(),
-            quic_reset()
+            reset.clone()
         ))
         .map_err(|error| listener_open_error("DoQ", addr, &error)));
     }
     if !cfg.listen_doh3.is_empty() || !set.doh3.lock_recover().is_empty() {
-        let tls_cfg = need(|s| s.doh3.clone())?;
+        let quic = slots()?;
+        let (tls_cfg, reset) = (quic.doh3.clone(), &quic.quic_reset);
         sync_one!(doh3, cfg.listen_doh3, "doh3", |addr| quic_socket(
             set,
             SocketRole::Doh3,
@@ -1091,7 +1065,7 @@ fn reconcile_encrypted(
             cfg.doh_path.clone(),
             shutdown.clone(),
             set.quic_memory.clone(),
-            quic_reset()
+            reset.clone()
         ))
         .map_err(|error| listener_open_error("DoH3", addr, &error)));
     }
@@ -1900,9 +1874,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    /// A damaged file costs only the resets after a restart, so QUIC still starts; the file is
-    /// left for the operator.
-    fn quic_reset_key_survives_restart_and_a_bad_file_is_kept() {
+    fn quic_reset_key_follows_the_private_key() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1912,24 +1884,21 @@ pub(crate) mod tests {
             std::process::id()
         ));
         std::fs::create_dir(&dir).unwrap();
-        let config_path = dir.join(CONFIG_FILE_NAME);
+        let kept = dir.join("self-signed.pem");
+        let cfg = Config {
+            tls_self_signed_host: Some("dns.test".into()),
+            ..Config::default()
+        };
+        let token = |file: Option<&std::path::Path>| {
+            TlsSlots::from_config(&cfg, file, TicketKeys::default())
+                .unwrap()
+                .quic_reset
+                .token(b"SERVERID")
+        };
 
-        let first = load_quic_reset_key(Some(&config_path)).token(b"SERVERID");
-        let key_path = dir.join("quic-reset.key");
-        assert_eq!(std::fs::read_to_string(&key_path).unwrap().len(), 64);
-        assert_eq!(
-            load_quic_reset_key(Some(&config_path)).token(b"SERVERID"),
-            first
-        );
-        assert_ne!(load_quic_reset_key(None).token(b"SERVERID"), first);
-
-        std::fs::write(&key_path, "not hex").unwrap();
-        assert_ne!(
-            load_quic_reset_key(Some(&config_path)).token(b"SERVERID"),
-            first
-        );
-        assert_eq!(std::fs::read_to_string(&key_path).unwrap(), "not hex");
-
+        let first = token(Some(&kept));
+        assert_eq!(token(Some(&kept)), first, "a restart with the same key");
+        assert_ne!(token(None), first, "a new private key");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
