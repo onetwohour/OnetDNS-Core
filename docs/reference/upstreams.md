@@ -672,7 +672,7 @@ File the DNSSEC root trust anchor is read from at startup. With automatic root t
 dnssec_roll_interval_secs = 0
 ```
 
-Interval used to advance authoritative-zone ZSK rollover state.
+Interval used to advance authoritative-zone ZSK rollover state. `0` turns rollover off. A new ZSK is published for 1/24 of the interval, and at least the DNSKEY TTL of 3,600 seconds, before it signs. After the switch the old key stays published for 1/12 of the interval, and at least the largest TTL in the zone, so validators always have the key for every signature they hold.
 
 **Unit:** seconds.
 

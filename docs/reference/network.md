@@ -501,7 +501,7 @@ IPv6 DNS server addresses sent in the Router Advertisement RDNSS option (RFC 810
 ipset_name_v4 = "onetdns-v4"
 ```
 
-Linux ipset that receives filtered IPv4 addresses.
+Linux ipset that receives filtered IPv4 addresses. ipset takes a set name of 1 to 31 bytes that does not start with `-`; any other name is reported as a warning and no addresses are added.
 
 ### `ipset_name_v6`
 
@@ -514,7 +514,7 @@ Linux ipset that receives filtered IPv4 addresses.
 ipset_name_v6 = "onetdns-v6"
 ```
 
-Linux ipset that receives filtered IPv6 addresses.
+Linux ipset that receives filtered IPv6 addresses. The name follows the same rule as `ipset_name_v4`.
 
 ### `ipset_domains`
 

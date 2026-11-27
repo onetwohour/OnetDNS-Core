@@ -32,13 +32,13 @@ pub(crate) fn zone_is_split_key(zc: &onetdns_config::ZoneConfig) -> bool {
 pub(crate) fn spawn_zsk_rollover(
     zones: Vec<(onetdns_proto::Name, std::path::PathBuf)>,
     interval: u64,
+    store: ZoneStoreHandle,
     reload_keys: ZoneKeyReload,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<Option<std::thread::JoinHandle<()>>> {
     if interval == 0 || zones.is_empty() {
         return Ok(None);
     }
-    let timing = rollover::RollTiming::from_interval(interval);
     let check = (interval / 100).clamp(1, 3600);
     std::thread::Builder::new()
         .name("zsk-rollover".into())
@@ -75,6 +75,21 @@ pub(crate) fn spawn_zsk_rollover(
                         state
                     }
                 };
+                // Only the wait before removing the old key depends on the zone's TTLs.
+                let max_ttl = if state.phase == rollover::Phase::Activate {
+                    store
+                        .load()
+                        .zone_exact(origin)
+                        .and_then(|zone| zone.all_records().map(|record| record.ttl).max())
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                let timing = rollover::RollTiming::new(
+                    interval,
+                    onetdns_dnssec::sign::DNSKEY_TTL,
+                    max_ttl,
+                );
                 let Some(next_state) = rollover::advance(state, now, timing) else {
                     continue;
                 };
@@ -117,6 +132,7 @@ pub(crate) fn spawn_zsk_rollover(
 /// starts a new one.
 pub(crate) fn rollover_restart(
     jobs: Arc<EdgeServices>,
+    store: ZoneStoreHandle,
     reload_keys: ZoneKeyReload,
 ) -> SecondaryRestart {
     Arc::new(move |next: &Config| -> Result<(), String> {
@@ -135,6 +151,7 @@ pub(crate) fn rollover_restart(
         let thread = spawn_zsk_rollover(
             zones,
             next.dnssec_roll_interval_secs,
+            store.clone(),
             reload_keys.clone(),
             stop,
         )
@@ -149,6 +166,8 @@ pub(crate) fn rollover_restart(
 /// Signed zones and their keys. Key rolls and config changes swap this one handle.
 pub(crate) type SharedZoneSigners =
     Arc<onetdns_core::ArcSwap<Vec<(onetdns_proto::Name, ZoneSigningCtx)>>>;
+
+pub(crate) type ZoneStoreHandle = Arc<onetdns_core::ArcSwap<onetdns_authority::ZoneStore>>;
 
 /// Rebuilds the zones whose keys rolled.
 pub(crate) type ZoneKeyReload =

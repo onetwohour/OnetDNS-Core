@@ -44,13 +44,14 @@ pub struct RollTiming {
 }
 
 impl RollTiming {
-    /// 0 disables rollover. The waits have a floor, so even a short period leaves validators time
-    /// to see the new key.
-    pub fn from_interval(interval: u64) -> Self {
+    /// 0 disables rollover. Validators cache the DNSKEY set for `dnskey_ttl` and signatures for up
+    /// to the zone's `max_ttl`, so however short the period, the new key stays published that long
+    /// before signing and the old one that long after.
+    pub fn new(interval: u64, dnskey_ttl: u32, max_ttl: u32) -> Self {
         RollTiming {
             interval,
-            publish_wait: (interval / 24).max(1),
-            activate_wait: (interval / 12).max(1),
+            publish_wait: (interval / 24).max(u64::from(dnskey_ttl)).max(1),
+            activate_wait: (interval / 12).max(u64::from(max_ttl)).max(1),
         }
     }
 }
@@ -151,7 +152,7 @@ mod tests {
 
     #[test]
     fn disabled_when_interval_zero() {
-        let t = RollTiming::from_interval(0);
+        let t = RollTiming::new(0, 3_600, 86_400);
         assert!(advance(RollState::stable(0), 1_000_000, t).is_none());
     }
 
@@ -199,10 +200,17 @@ mod tests {
     }
 
     #[test]
-    fn from_interval_waits_are_bounded() {
-        let t = RollTiming::from_interval(30 * 86_400);
-        assert!(t.publish_wait >= 1 && t.publish_wait < t.interval);
-        assert!(t.activate_wait >= 1 && t.activate_wait < t.interval);
-        assert!(t.activate_wait > t.publish_wait);
+    fn waits_scale_with_a_long_period() {
+        let t = RollTiming::new(30 * 86_400, 3_600, 86_400);
+        assert_eq!(t.publish_wait, 30 * 86_400 / 24);
+        assert_eq!(t.activate_wait, 30 * 86_400 / 12);
+    }
+
+    #[test]
+    /// A short period must not end a wait before validators drop what they cached.
+    fn waits_outlast_cached_keys_and_signatures() {
+        let t = RollTiming::new(60, 3_600, 86_400);
+        assert_eq!(t.publish_wait, 3_600);
+        assert_eq!(t.activate_wait, 86_400);
     }
 }

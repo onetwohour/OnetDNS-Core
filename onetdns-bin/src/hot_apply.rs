@@ -750,7 +750,7 @@ impl HotApplyDeps {
                 next.querylog,
                 next.anonymize_client_ip,
                 next.querylog_ignored.clone(),
-                next.querylog_size.max(1),
+                next.querylog_capacity(),
                 next.querylog_retention_secs,
                 next.stats_retention_secs,
             );

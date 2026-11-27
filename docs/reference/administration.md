@@ -183,7 +183,7 @@ Records query name, client, transport, and result in the recent query log.
 querylog_size = 200
 ```
 
-Maximum recent query-log entries kept in memory and exposed to the dashboard.
+Maximum recent query-log entries kept in memory and exposed to the dashboard. At most 1,000,000; a larger value is read as 1,000,000 and reported as a warning.
 
 **Unit:** entries.
 

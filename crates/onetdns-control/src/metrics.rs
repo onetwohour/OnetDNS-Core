@@ -1933,7 +1933,7 @@ pub fn channel(
     let persist_state = Arc::new(RwLock::new(persist.clone()));
     metrics.set_history_retention(opts.stats_retention_secs);
 
-    let mut initial_recent = VecDeque::<QueryEvent>::with_capacity(log_cap);
+    let mut initial_recent = VecDeque::<QueryEvent>::new();
     let mut initial_top = TopCounters::default();
     if let Some(p) = &persist.querylog_file {
         initial_recent = crate::persist::load_querylog(

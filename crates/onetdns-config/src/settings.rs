@@ -14,6 +14,8 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 /// Every upstream adds work per query.
 const MAX_UPSTREAMS_PER_RESOLVER: usize = 256;
 const MAX_DYNAMIC_RECORD_VALUES: usize = 64;
+/// Larger values are read as this cap rather than refused, since a released version accepted them.
+const MAX_QUERYLOG_SIZE: usize = 1_000_000;
 /// Hard security limit on NSEC3 iterations the validator accepts.
 const MAX_VALIDATOR_NSEC3_ITERATIONS: u16 = 150;
 /// DNS-over-HTTP/3 servers used when no upstream is configured. Some networks intercept plain
@@ -1748,6 +1750,11 @@ impl Config {
         out
     }
 
+    /// Entries the query log keeps in memory.
+    pub fn querylog_capacity(&self) -> usize {
+        self.querylog_size.clamp(1, MAX_QUERYLOG_SIZE)
+    }
+
     /// The AD bit set by an upstream is never trusted: recursion validates along referrals, and
     /// forwarding builds the chain by asking upstreams for DNSKEY and DS. Everything reporting
     /// validation as on must use this, or operators would trust unvalidated answers.
@@ -1814,6 +1821,24 @@ impl Config {
         }
         if self.acl_unlisted == AclUnlisted::Drop && self.acl_default_allow() {
             soft.push("`acl_unlisted = \"drop\"` applies to clients outside `acl_allow` and `acl_allow_ids`; both are empty, so every client is allowed and nothing is dropped".into());
+        }
+        if self.querylog_size > MAX_QUERYLOG_SIZE {
+            soft.push(format!(
+                "`querylog_size` is above {MAX_QUERYLOG_SIZE}; the query log keeps the newest {MAX_QUERYLOG_SIZE} entries"
+            ));
+        }
+        for (key, name) in [
+            ("ipset_name_v4", &self.ipset_name_v4),
+            ("ipset_name_v6", &self.ipset_name_v6),
+        ] {
+            if let Some(name) = name {
+                // ipset refuses longer names and reads a leading `-` as an option.
+                if name.is_empty() || name.len() > 31 || name.starts_with('-') {
+                    soft.push(format!(
+                        "`{key}` must be a set name of 1 to 31 bytes that does not start with `-`; ipset refuses {name:?}, so no addresses are added"
+                    ));
+                }
+            }
         }
         let ipset_named = self.ipset_name_v4.is_some() || self.ipset_name_v6.is_some();
         if ipset_named == self.ipset_domains.is_empty() {
@@ -7507,6 +7532,59 @@ answer = \"target.example\"
             Config::from_toml_str(apart).is_ok(),
             "포트가 다르면 함께 열 수 있습니다"
         );
+    }
+
+    #[test]
+    /// A released version accepted any size, so a larger one still loads, but the log stops at the
+    /// cap instead of growing until memory runs out.
+    fn querylog_size_above_the_cap_loads_capped_with_warning() {
+        let cfg = Config::from_toml_str("querylog_size = 1000000000\n")
+            .expect("이전 릴리스가 받던 값입니다");
+        assert_eq!(cfg.querylog_capacity(), MAX_QUERYLOG_SIZE);
+        assert!(cfg
+            .advisories()
+            .iter()
+            .any(|line| line.contains("querylog_size")));
+
+        let cfg = Config::from_toml_str("querylog_size = 0\n").unwrap();
+        assert_eq!(cfg.querylog_capacity(), 1);
+        assert!(Config::default().advisories().is_empty());
+    }
+
+    #[test]
+    fn ipset_names_ipset_refuses_are_reported() {
+        for name in ["", "-exist", &"x".repeat(32)] {
+            let cfg = Config::from_toml_str(&format!(
+                "ipset_name_v4 = {name:?}\nipset_domains = [\"example.com\"]\n"
+            ))
+            .expect("이전 릴리스가 받던 값입니다");
+            assert!(
+                cfg.advisories()
+                    .iter()
+                    .any(|line| line.contains("ipset_name_v4")),
+                "{name:?}"
+            );
+        }
+        let cfg = Config::from_toml_str(
+            "ipset_name_v4 = \"dns-v4\"\nipset_domains = [\"example.com\"]\n",
+        )
+        .unwrap();
+        assert!(!cfg
+            .advisories()
+            .iter()
+            .any(|line| line.contains("ipset_name_v4")));
+    }
+
+    #[test]
+    fn an_unrecognized_value_is_quoted_in_the_error() {
+        let error = Config::from_toml_str("cache_size = nan\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("\"nan\""), "{error}");
+        let error = Config::from_toml_str("cache_size =\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Missing value"), "{error}");
     }
 
     #[test]

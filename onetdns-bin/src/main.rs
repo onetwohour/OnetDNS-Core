@@ -1181,7 +1181,7 @@ impl ServeShared {
                 cfg.querylog,
                 cfg.anonymize_client_ip,
                 cfg.querylog_ignored.clone(),
-                cfg.querylog_size.max(1),
+                cfg.querylog_capacity(),
                 cfg.querylog_retention_secs,
                 cfg.stats_retention_secs,
             );
@@ -1199,7 +1199,7 @@ impl ServeShared {
         }
         let pair = onetdns_control::channel(
             1024,
-            cfg.querylog_size.max(1),
+            cfg.querylog_capacity(),
             cfg.querylog_retention_secs,
             onetdns_control::RecorderOpts {
                 querylog: cfg.querylog,
@@ -1218,7 +1218,7 @@ impl ServeShared {
         })?;
         onetdns_core::debug!(
             event = "stats.channel_created",
-            querylog_capacity = cfg.querylog_size.max(1),
+            querylog_capacity = cfg.querylog_capacity(),
             history_retention_secs = cfg.stats_retention_secs,
             "Started collecting statistics"
         );
@@ -1657,7 +1657,11 @@ pub fn serve(
     exclusive
         .install(
             &restarts.zsk_rollover,
-            rollover_restart(jobs.zsk_rollover.clone(), reload_zone_keys),
+            rollover_restart(
+                jobs.zsk_rollover.clone(),
+                zones.store.clone(),
+                reload_zone_keys,
+            ),
             &cfg,
         )
         .map_err(std::io::Error::other)?;

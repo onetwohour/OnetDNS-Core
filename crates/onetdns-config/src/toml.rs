@@ -270,7 +270,23 @@ impl<'a> Parser<'a> {
             Some(b'{') => self.parse_inline_table(),
             Some(c) if c == b't' || c == b'f' => self.parse_bool(),
             Some(c) if c == b'-' || c == b'+' || c.is_ascii_digit() => self.parse_number(),
-            other => Err(format!("Could not parse the value: {other:?}")),
+            _ => {
+                let rest = &self.s[self.i..];
+                let end = rest
+                    .iter()
+                    .position(|b| matches!(b, b'\n' | b'\r' | b',' | b']' | b'}' | b'#'))
+                    .unwrap_or(rest.len())
+                    .min(40);
+                let text = String::from_utf8_lossy(&rest[..end]);
+                let text = text.trim();
+                if text.is_empty() {
+                    Err(format!("Missing value (position {})", self.i))
+                } else {
+                    Err(format!(
+                        "Unrecognized value {text:?}: write a quoted string, a number, true or false, an array, or an inline table"
+                    ))
+                }
+            }
         }
     }
 

@@ -14,6 +14,9 @@ use crate::{signed_data, Dnskey, Ds, Rrsig};
 const INCEPTION_SKEW: u64 = 3_600;
 /// Shorter means more re-signing; longer means a revoked key stays usable longer.
 const VALIDITY: u64 = 14 * 86_400;
+/// How long validators may cache a signed zone's DNSKEY set; a ZSK rollover waits at least this
+/// long after publishing a new key.
+pub const DNSKEY_TTL: u32 = 3_600;
 
 /// Algorithm 15 signs more cheaply, but validators that lack it treat the zone as insecure, so the
 /// default stays 13.
@@ -468,7 +471,7 @@ pub fn sign_zone_reusing(
         .filter(|r| !matches!(r.rtype.0, 46 | 47 | 48 | 50 | 51 | 59 | 60))
         .cloned()
         .collect();
-    out.extend(signer.dnskey_records(3_600));
+    out.extend(signer.dnskey_records(DNSKEY_TTL));
     out.extend(signer.cds_cdnskey_records(3_600));
 
     let origin_labels = signer.owner.num_labels();
